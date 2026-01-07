@@ -47,7 +47,7 @@ import { PushSubscription } from './modules/notifications/entities/push-subscrip
           encrypt: false,
           trustServerCertificate: true,
         },
-        logging: configService.get('APP_ENV') === 'development',
+        logging: false,
       }),
       inject: [ConfigService],
     }),

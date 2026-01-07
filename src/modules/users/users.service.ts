@@ -3,16 +3,26 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import * as bcrypt from 'bcrypt';
 import { User } from '../../entities/user.entity';
+import { MaintenanceRequest } from '../../entities/maintenance-request.entity';
 import { CreateUserDto } from './dto/create-user.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
 import { UpdateProfileDto, ChangePasswordDto } from './dto/update-profile.dto';
 import { Role } from '../../common/enums/role.enum';
+import { Status } from '../../common/enums/status.enum';
+
+export interface TechnicianWithWorkload extends User {
+  inProgressCount: number;
+  openCount: number;
+  totalAssigned: number;
+}
 
 @Injectable()
 export class UsersService {
   constructor(
     @InjectRepository(User)
     private readonly userRepository: Repository<User>,
+    @InjectRepository(MaintenanceRequest)
+    private readonly requestRepository: Repository<MaintenanceRequest>,
   ) {}
 
   async create(createUserDto: CreateUserDto): Promise<User> {
@@ -62,6 +72,43 @@ export class UsersService {
     return this.userRepository.find({
       where: { role: Role.TECHNICIAN },
       order: { fullName: 'ASC' },
+    });
+  }
+
+  async findTechniciansWithWorkload(): Promise<TechnicianWithWorkload[]> {
+    const technicians = await this.userRepository.find({
+      where: { role: Role.TECHNICIAN },
+      order: { fullName: 'ASC' },
+    });
+
+    const techniciansWithWorkload = await Promise.all(
+      technicians.map(async (tech) => {
+        const [inProgressCount, openCount, totalAssigned] = await Promise.all([
+          this.requestRepository.count({
+            where: { assignedTo: tech.id, status: Status.IN_PROGRESS },
+          }),
+          this.requestRepository.count({
+            where: { assignedTo: tech.id, status: Status.OPEN },
+          }),
+          this.requestRepository.count({
+            where: { assignedTo: tech.id },
+          }),
+        ]);
+
+        return {
+          ...tech,
+          inProgressCount,
+          openCount,
+          totalAssigned,
+        } as TechnicianWithWorkload;
+      }),
+    );
+
+    // Sort by in-progress count (ascending) - recommend technician with least workload
+    return techniciansWithWorkload.sort((a, b) => {
+      const aWorkload = a.inProgressCount + a.openCount;
+      const bWorkload = b.inProgressCount + b.openCount;
+      return aWorkload - bWorkload;
     });
   }
 

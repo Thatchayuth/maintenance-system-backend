@@ -20,6 +20,7 @@ import { UpdateStatusDto } from './dto/update-status.dto';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
+import { Public } from '../auth/decorators/public.decorator';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { Role } from '../../common/enums/role.enum';
 
@@ -52,6 +53,14 @@ export class MaintenanceRequestsController {
   @ApiResponse({ status: 200, description: 'Request statistics' })
   getStats() {
     return this.requestsService.getStats();
+  }
+
+  @Public()
+  @Get('tv-dashboard')
+  @ApiOperation({ summary: 'Get TV Dashboard data for realtime display (Public)' })
+  @ApiResponse({ status: 200, description: 'TV Dashboard data' })
+  getTvDashboard() {
+    return this.requestsService.getTvDashboardData();
   }
 
   @Get('my-requests')

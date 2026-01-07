@@ -1,6 +1,6 @@
 import { Injectable, NotFoundException, ForbiddenException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, FindOptionsWhere, Like, Between } from 'typeorm';
+import { Repository, FindOptionsWhere, Like, Between, MoreThanOrEqual, LessThanOrEqual } from 'typeorm';
 import { MaintenanceRequest } from '../../entities/maintenance-request.entity';
 import { CreateMaintenanceRequestDto } from './dto/create-maintenance-request.dto';
 import { UpdateMaintenanceRequestDto } from './dto/update-maintenance-request.dto';
@@ -167,14 +167,10 @@ export class MaintenanceRequestsService {
     assignDto: AssignTechnicianDto,
     userId: string,
   ): Promise<MaintenanceRequest> {
-    const request = await this.findOne(id);
-
-    request.assignedTo = assignDto.technicianId;
-    if (request.status === Status.OPEN) {
-      request.status = Status.IN_PROGRESS;
-    }
-
-    const updatedRequest = await this.requestRepository.save(request);
+    // Use update() directly to ensure the value is saved
+    await this.requestRepository.update(id, {
+      assignedTo: assignDto.technicianId,
+    });
 
     // Create log entry
     await this.logsService.create({
@@ -183,10 +179,13 @@ export class MaintenanceRequestsService {
       message: `Technician assigned to the request`,
     });
 
+    // Get updated request for WebSocket notification
+    const updatedRequest = await this.findOne(id);
+
     // Notify via WebSocket
     this.maintenanceGateway.notifyRequestAssigned(updatedRequest);
 
-    return this.findOne(updatedRequest.id);
+    return updatedRequest;
   }
 
   async updateStatus(
@@ -241,5 +240,192 @@ export class MaintenanceRequestsService {
     ]);
 
     return { total, open, inProgress, completed, canceled };
+  }
+
+  async getTvDashboardData(): Promise<{
+    todayStats: {
+      total: number;
+      open: number;
+      inProgress: number;
+      completed: number;
+      canceled: number;
+    };
+    pendingRequests: MaintenanceRequest[];
+    inProgressRequests: MaintenanceRequest[];
+    recentCompleted: MaintenanceRequest[];
+    technicianWorkload: {
+      technicianId: string;
+      technicianName: string;
+      inProgress: number;
+      completed: number;
+      open: number;
+    }[];
+    downtimeSummary: {
+      totalDowntimeMinutes: number;
+      averageResolutionMinutes: number;
+      requestsWithDowntime: {
+        id: string;
+        title: string;
+        machineName: string;
+        startTime: Date;
+        endTime: Date | null;
+        downtimeMinutes: number;
+      }[];
+    };
+    weeklyChart: {
+      date: string;
+      open: number;
+      completed: number;
+      canceled: number;
+    }[];
+  }> {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+
+    // Today's stats
+    const [todayTotal, todayOpen, todayInProgress, todayCompleted, todayCanceled] = await Promise.all([
+      this.requestRepository.count({
+        where: { createdAt: Between(today, tomorrow) },
+      }),
+      this.requestRepository.count({
+        where: { createdAt: Between(today, tomorrow), status: Status.OPEN },
+      }),
+      this.requestRepository.count({
+        where: { createdAt: Between(today, tomorrow), status: Status.IN_PROGRESS },
+      }),
+      this.requestRepository.count({
+        where: { createdAt: Between(today, tomorrow), status: Status.COMPLETED },
+      }),
+      this.requestRepository.count({
+        where: { createdAt: Between(today, tomorrow), status: Status.CANCELED },
+      }),
+    ]);
+
+    // Pending requests (OPEN status)
+    const pendingRequests = await this.requestRepository.find({
+      where: { status: Status.OPEN },
+      relations: ['machine', 'requestedByUser', 'assignedToUser'],
+      order: { createdAt: 'DESC' },
+      take: 10,
+    });
+
+    // In Progress requests
+    const inProgressRequests = await this.requestRepository.find({
+      where: { status: Status.IN_PROGRESS },
+      relations: ['machine', 'requestedByUser', 'assignedToUser'],
+      order: { createdAt: 'DESC' },
+      take: 10,
+    });
+
+    // Recent completed (today)
+    const recentCompleted = await this.requestRepository.find({
+      where: { 
+        status: Status.COMPLETED,
+        updatedAt: MoreThanOrEqual(today),
+      },
+      relations: ['machine', 'requestedByUser', 'assignedToUser'],
+      order: { updatedAt: 'DESC' },
+      take: 10,
+    });
+
+    // Technician workload
+    const technicianWorkloadRaw = await this.requestRepository
+      .createQueryBuilder('request')
+      .select('request.assigned_to', 'technicianId')
+      .addSelect('assignedToUser.fullName', 'technicianName')
+      .addSelect(`SUM(CASE WHEN request.status = 'IN_PROGRESS' THEN 1 ELSE 0 END)`, 'inProgress')
+      .addSelect(`SUM(CASE WHEN request.status = 'COMPLETED' THEN 1 ELSE 0 END)`, 'completed')
+      .addSelect(`SUM(CASE WHEN request.status = 'OPEN' THEN 1 ELSE 0 END)`, 'open')
+      .leftJoin('request.assignedToUser', 'assignedToUser')
+      .where('request.assigned_to IS NOT NULL')
+      .groupBy('request.assigned_to')
+      .addGroupBy('assignedToUser.fullName')
+      .getRawMany();
+
+    const technicianWorkload = technicianWorkloadRaw.map(t => ({
+      technicianId: t.technicianId,
+      technicianName: t.technicianName || 'Unknown',
+      inProgress: parseInt(t.inProgress) || 0,
+      completed: parseInt(t.completed) || 0,
+      open: parseInt(t.open) || 0,
+    }));
+
+    // Downtime summary (completed requests with resolution time)
+    const completedWithTime = await this.requestRepository.find({
+      where: { status: Status.COMPLETED },
+      relations: ['machine'],
+      order: { updatedAt: 'DESC' },
+      take: 20,
+    });
+
+    const requestsWithDowntime = completedWithTime.map(req => {
+      const downtimeMinutes = Math.round(
+        (new Date(req.updatedAt).getTime() - new Date(req.createdAt).getTime()) / (1000 * 60)
+      );
+      return {
+        id: req.id,
+        title: req.title,
+        machineName: req.machine?.name || 'Unknown',
+        startTime: req.createdAt,
+        endTime: req.updatedAt,
+        downtimeMinutes,
+      };
+    });
+
+    const totalDowntimeMinutes = requestsWithDowntime.reduce((sum, r) => sum + r.downtimeMinutes, 0);
+    const averageResolutionMinutes = requestsWithDowntime.length > 0 
+      ? Math.round(totalDowntimeMinutes / requestsWithDowntime.length) 
+      : 0;
+
+    // Weekly chart data (last 7 days)
+    const weeklyChart = [];
+    for (let i = 6; i >= 0; i--) {
+      const date = new Date();
+      date.setDate(date.getDate() - i);
+      date.setHours(0, 0, 0, 0);
+      const nextDate = new Date(date);
+      nextDate.setDate(nextDate.getDate() + 1);
+
+      const [open, completed, canceled] = await Promise.all([
+        this.requestRepository.count({
+          where: { createdAt: Between(date, nextDate), status: Status.OPEN },
+        }),
+        this.requestRepository.count({
+          where: { updatedAt: Between(date, nextDate), status: Status.COMPLETED },
+        }),
+        this.requestRepository.count({
+          where: { updatedAt: Between(date, nextDate), status: Status.CANCELED },
+        }),
+      ]);
+
+      weeklyChart.push({
+        date: date.toISOString().split('T')[0],
+        open,
+        completed,
+        canceled,
+      });
+    }
+
+    return {
+      todayStats: {
+        total: todayTotal,
+        open: todayOpen,
+        inProgress: todayInProgress,
+        completed: todayCompleted,
+        canceled: todayCanceled,
+      },
+      pendingRequests,
+      inProgressRequests,
+      recentCompleted,
+      technicianWorkload,
+      downtimeSummary: {
+        totalDowntimeMinutes,
+        averageResolutionMinutes,
+        requestsWithDowntime: requestsWithDowntime.slice(0, 10),
+      },
+      weeklyChart,
+    };
   }
 }

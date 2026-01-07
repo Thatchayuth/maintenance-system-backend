@@ -83,6 +83,13 @@ export class UsersController {
     return this.usersService.findTechnicians();
   }
 
+  @Get('technicians/workload')
+  @ApiOperation({ summary: 'Get all technicians with workload info' })
+  @ApiResponse({ status: 200, description: 'List of technicians with in-progress and open task counts' })
+  findTechniciansWithWorkload() {
+    return this.usersService.findTechniciansWithWorkload();
+  }
+
   @Get(':id')
   @ApiOperation({ summary: 'Get a user by ID' })
   @ApiResponse({ status: 200, description: 'User found' })
